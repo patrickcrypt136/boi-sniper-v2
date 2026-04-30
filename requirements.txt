@@ -2,3 +2,5 @@ web3
 requests
 python-dotenv
 aiohttp
+websocket-client
+eth-account
