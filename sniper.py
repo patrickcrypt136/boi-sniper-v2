@@ -70,7 +70,7 @@ CHAINS = {
     },
     "bsc": {
         "rpc_http": os.getenv("BSC_RPC_HTTP", "https://bsc-dataseed1.defibit.io"),
-        "rpc_ws":   os.getenv("BSC_RPC_WS",   "wss://bsc-ws.nodies.app"),
+        "rpc_ws":   os.getenv("BSC_RPC_WS",   "wss://bsc-rpc.publicnode.com"),
         "contract": "0xC12ab9BC529809d6041564FE6aC65FAF8e190E7B",
         "chain_id": 56,
         "symbol":   "BNB",
@@ -740,36 +740,35 @@ if __name__ == "__main__":
     banner()
     init()
 
-    # ── Manual sells (uncomment + exit) ──────────────
-    # sell_shares("username", "0xWALLET", "bsc", amount="all")
-    # sell_all_holdings()
-    # exit()
-    # ─────────────────────────────────────────────────
-
     tg(
         f"🤖 <b>BOI Max Speed Sniper v5.0</b>\n\n"
         f"💳 <code>{MY_WALLET}</code>\n"
         f"⛓️ AVAX + BSC\n"
         f"💣 Gas war: {GAS_WAR_MULTIPLIERS}\n"
-        f"🔭 Mempool: LIVE\n"
-        f"📐 Price: AUTO-CALIBRATED\n"
-        f"🚫 Zero RPC calls at fire time"
+        f"📐 Price: AUTO-CALIBRATED"
     )
 
-    # Mempool watchers
+    # Start mempool watchers
     for chain in CHAINS:
-        threading.Thread(target=_watch_mempool, args=(chain,), daemon=True).start()
+        t = threading.Thread(target=_watch_mempool, args=(chain,), daemon=True)
+        t.start()
+        log(f"🔭 [{chain.upper()}] Mempool thread started: {t.is_alive()}")
 
-    # HTTP fallback
-    threading.Thread(target=_http_loop, daemon=True).start()
+    # Start HTTP fallback
+    t2 = threading.Thread(target=_http_loop, daemon=True)
+    t2.start()
+    log(f"🌐 HTTP thread started: {t2.is_alive()}")
 
-    # Re-calibration loop
-    threading.Thread(target=_recal_loop, daemon=True).start()
+    # Start recalibration loop
+    t3 = threading.Thread(target=_recal_loop, daemon=True)
+    t3.start()
+    log(f"🔄 Recal thread started: {t3.is_alive()}")
 
-    log("🚀 Running. Ctrl+C to stop.\n")
+    log("🚀 All threads running. Ctrl+C to stop.\n")
+
     try:
         while True:
-            time.sleep(60)
-            log("💓 alive")
+            time.sleep(30)
+            log(f"💓 alive | threads: mempool={t.is_alive()} http={t2.is_alive()}")
     except KeyboardInterrupt:
         log("🛑 Stopped.")
