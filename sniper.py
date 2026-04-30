@@ -623,8 +623,12 @@ def _watch_mempool(chain: str):
     def on_close(ws, *_):
         log(f"🔌 [{chain.upper()}] WS closed — retry in 3s")
         time.sleep(3)
-        _watch_mempool(chain)
-
+        # Don't call recursively — let the thread restart it
+    threading.Thread(
+        target=_watch_mempool,
+        args=(chain,),
+        daemon=True
+    ).start()
     def on_open(ws):
         log(f"✅ [{chain.upper()}] Mempool WS live")
         ws.send(sub_msg)
