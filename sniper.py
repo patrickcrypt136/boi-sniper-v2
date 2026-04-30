@@ -186,7 +186,7 @@ def tg(text):
 
 def make_calldata(contract, subject: str, me: str) -> bytes:
     """Encode buyShares calldata."""
-    return contract.encodeABI(
+    return contract.encode_abi(
         fn_name="buyShares",
         args=[
             Web3.to_checksum_address(subject),
@@ -496,7 +496,7 @@ def sell_shares(username: str, wallet: str, chain: str, amount="all"):
         sell_eth   = float(client.w3.from_wei(sell_price, "ether"))
         log(f"💰 Selling {sell_amt} units @{username} → {sell_eth:.8f} {client.symbol}")
 
-        data  = client.contract.encodeABI(
+        data = client.contract.encode_abi(
             fn_name="sellShares",
             args=[subject, client.me, sell_amt],
         )
