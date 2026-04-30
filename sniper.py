@@ -1,76 +1,43 @@
-"""
-BOI THE BEAR — MAXIMUM SPEED SNIPER v5.0
-════════════════════════════════════════════════════════
-EVERY MILLISECOND OPTIMISED:
-  ✅ Pre-encoded tx calldata at startup (no ABI encode at fire time)
-  ✅ Full tx body from WS (no get_transaction() RPC call)
-  ✅ Gas war — fires 3 txs with escalating gas simultaneously
-  ✅ Raw eth_sendRawTransaction (no build_transaction overhead)
-  ✅ Nonce pre-cached locally
-  ✅ Gas pre-cached (30s TTL, refreshed in background)
-  ✅ Auto-calibrated first-buy price at startup
-  ✅ WebSocket mempool (fires before API reflects new user)
-  ✅ HTTP fallback poller (catches anything mempool misses)
-  ✅ Zero balance / supply / quote checks at fire time
-  ✅ Dedup lock (never double-fires same wallet)
-
-INSTALL:
-  pip install web3 python-dotenv requests websocket-client eth-account
-
-.env:
-  PRIVATE_KEY=0x...
-  MY_WALLET=0x...
-  BOT_TOKEN=...
-  CHAT_ID=...
-  COOKIE=...
-  AVAX_RPC_HTTP=https://...
-  AVAX_RPC_WS=wss://...
-  BSC_RPC_HTTP=https://...
-  BSC_RPC_WS=wss://...
-════════════════════════════════════════════════════════
-"""
-
-import os, time, json, threading, requests, websocket
+import time
+import requests
 from web3 import Web3
-from eth_account import Account
-from eth_account.datastructures import SignedTransaction
 from dotenv import load_dotenv
+import os
 
 load_dotenv()
 
 # ── ENV ───────────────────────────────────────────────
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+COOKIE      = os.getenv("COOKIE")
 MY_WALLET   = os.getenv("MY_WALLET")
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 CHAT_ID     = os.getenv("CHAT_ID")
-COOKIE      = os.getenv("COOKIE")
 
 # ── CONFIG ────────────────────────────────────────────
-SHARE_AMOUNT         = 100      # 100 units = 1 full ticket
-SLIPPAGE             = 1.15     # 15% above calibrated price
-GAS_LIMIT            = 300000
-PRIORITY_GWEI        = 5
-GAS_MULTIPLIER       = 1.25
-GAS_CACHE_TTL        = 30
-TX_TIMEOUT           = 60
-HTTP_POLL_INTERVAL   = 0.5
+SHARE_AMOUNT    = 100        # 100 = 1 full ticket (basis points)
+SLIPPAGE        = 1.10       # 10% slippage buffer
+GAS_LIMIT       = 250000     # Slightly higher for safety
+PRIORITY_GWEI   = 2          # maxPriorityFeePerGas
+GAS_MULTIPLIER  = 1.25       # base fee multiplier
+POLL_INTERVAL   = 1          # seconds between new-arrival checks
+TX_TIMEOUT      = 60         # seconds to wait for receipt
 
-# Gas war — fire 3 txs with these multipliers simultaneously
-# First one to land wins. Higher = more gas spent but faster inclusion.
-GAS_WAR_MULTIPLIERS  = [1.0, 1.5, 2.2]
+API_URL = (
+    "https://www.boithebear.com/api/socialfi/new-arrivals"
+    "?limit=10&offset=0&userId=562acdb3-50d7-49aa-86d4-1b778da6ca12"
+)
 
+# ── CHAINS ────────────────────────────────────────────
 CHAINS = {
     "avalanche": {
-        "rpc_http": os.getenv("AVAX_RPC_HTTP", "https://api.avax.network/ext/bc/C/rpc"),
-        "rpc_ws":   os.getenv("AVAX_RPC_WS",   "wss://api.avax.network/ext/bc/C/ws"),
+        "rpc":      "https://api.avax.network/ext/bc/C/rpc",
         "contract": "0x2Fec21938e4d11117Bda59a5fE880c1d0AE54A7F",
         "chain_id": 43114,
         "symbol":   "AVAX",
         "explorer": "https://snowtrace.io/tx/",
     },
     "bsc": {
-        "rpc_http": os.getenv("BSC_RPC_HTTP", "https://bsc-dataseed1.defibit.io"),
-        "rpc_ws":   os.getenv("BSC_RPC_WS",   "wss://bsc-rpc.publicnode.com"),
+        "rpc":      "https://bsc-dataseed1.defibit.io",
         "contract": "0xC12ab9BC529809d6041564FE6aC65FAF8e190E7B",
         "chain_id": 56,
         "symbol":   "BNB",
@@ -78,6 +45,7 @@ CHAINS = {
     },
 }
 
+# ── ABI ───────────────────────────────────────────────
 ABI = [
     {
         "inputs": [
@@ -88,6 +56,16 @@ ABI = [
         "name": "buyShares",
         "outputs": [],
         "stateMutability": "payable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "_sharesSubject", "type": "address"},
+            {"internalType": "uint256", "name": "_amount",        "type": "uint256"},
+        ],
+        "name": "getBuyPriceAfterFee",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
         "type": "function",
     },
     {
@@ -130,43 +108,33 @@ ABI = [
         "stateMutability": "view",
         "type": "function",
     },
-    {
-        "inputs": [
-            {"internalType": "address", "name": "_sharesSubject", "type": "address"},
-            {"internalType": "uint256", "name": "_amount",        "type": "uint256"},
-        ],
-        "name": "getBuyPriceAfterFee",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
 ]
 
 HEADERS = {
     "accept":     "*/*",
     "cookie":     COOKIE,
     "referer":    "https://www.boithebear.com/",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/147.0.0.0 Safari/537.36",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/147.0.0.0 Safari/537.36"
+    ),
 }
 
-API_URL = (
-    "https://www.boithebear.com/api/socialfi/new-arrivals"
-    "?limit=10&offset=0&userId=562acdb3-50d7-49aa-86d4-1b778da6ca12"
-)
-
-# buyShares(address,address,uint256) selector — precomputed
-BUY_SEL = Web3.keccak(text="buyShares(address,address,uint256)")[:4].hex()
+seen_ids  = set()
+first_run = True
 
 
 # ══════════════════════════════════════════════════════
 #  HELPERS
 # ══════════════════════════════════════════════════════
 
-def log(msg):
-    ms = str(int(time.time() * 1000) % 1000).zfill(3)
-    print(f"[{time.strftime('%H:%M:%S')}.{ms}] {msg}")
+def log(msg: str):
+    """Timestamped console print."""
+    ts = time.strftime("%Y-%m-%d %I:%M:%S %p")
+    print(f"[{ts}] {msg}")
 
-def tg(text):
+
+def send_telegram(text: str):
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -174,601 +142,360 @@ def tg(text):
             timeout=10,
         )
     except Exception as e:
-        log(f"⚠️ TG: {e}")
+        log(f"⚠️  Telegram error: {e}")
 
 
-# ══════════════════════════════════════════════════════
-#  PRE-ENCODED CALLDATA
-#  buyShares(subject, me, SHARE_AMOUNT) encoded once at
-#  startup. At fire time we only swap the subject bytes.
-#  Zero ABI encoding overhead at hot path.
-# ══════════════════════════════════════════════════════
-
-def make_calldata(contract, subject: str, me: str) -> bytes:
-    """Encode buyShares calldata."""
-    return contract.encode_abi(
-        "buyShares",
-        args=[
-            Web3.to_checksum_address(subject),
-            Web3.to_checksum_address(me),
-            SHARE_AMOUNT,
-        ],
+def get_contract(chain: str):
+    cfg      = CHAINS[chain]
+    w3       = Web3(Web3.HTTPProvider(cfg["rpc"]))
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(cfg["contract"]),
+        abi=ABI,
     )
-
-def swap_subject_in_calldata(base_data: bytes, new_subject: str) -> bytes:
-    """
-    Replace subject address in pre-encoded calldata.
-    Layout: [4 selector][32 subject][32 to][32 amount]
-    Subject starts at byte 4, address is last 20 bytes of 32-byte word.
-    """
-    addr = bytes.fromhex(new_subject[2:].lower())   # 20 bytes
-    padded = b'\x00' * 12 + addr                    # 32 bytes
-    return base_data[:4] + padded + base_data[36:]  # swap subject word
+    return w3, contract, cfg
 
 
-# ══════════════════════════════════════════════════════
-#  CHAIN CLIENT
-# ══════════════════════════════════════════════════════
-
-class ChainClient:
-    def __init__(self, name: str):
-        cfg           = CHAINS[name]
-        self.name     = name
-        self.cfg      = cfg
-        self.symbol   = cfg["symbol"]
-        self.w3       = Web3(Web3.HTTPProvider(cfg["rpc_http"]))
-        self.contract = self.w3.eth.contract(
-            address=Web3.to_checksum_address(cfg["contract"]),
-            abi=ABI,
-        )
-        self.me          = Web3.to_checksum_address(MY_WALLET)
-        self.contract_lc = cfg["contract"].lower()
-
-        # First-buy price (set by calibrate())
-        self.first_buy: int = 0
-
-        # Pre-encoded base calldata with dummy subject (swapped at fire time)
-        # We use a placeholder — it gets replaced per-snipe
-        self._base_calldata: bytes = b""
-
-        # Gas cache
-        self._gas      = None
-        self._gas_ts   = 0.0
-        self._gas_lock = threading.Lock()
-
-        # Nonce — local counter, never fetched mid-snipe
-        self._nonce      = None
-        self._nonce_lock = threading.Lock()
-
-        # Fired wallets — dedup
-        self._fired      = set()
-        self._fired_lock = threading.Lock()
-
-    def init(self):
-        """Call once after construction."""
-        block = self.w3.eth.block_number
-        log(f"✅ [{self.name.upper()}] Connected | block #{block}")
-        self._refresh_gas()
-        self._refresh_nonce()
-        # Pre-encode calldata with a dummy subject (address(0))
-        self._base_calldata = make_calldata(
-            self.contract,
-            "0x0000000000000000000000000000000000000000",
-            self.me,
-        )
-
-    # ── Gas ──────────────────────────────────────────
-
-    def _refresh_gas(self):
-        with self._gas_lock:
-            try:
-                latest   = self.w3.eth.get_block("latest")
-                base_fee = latest["baseFeePerGas"]
-                priority = self.w3.to_wei(str(PRIORITY_GWEI), "gwei")
-                self._gas = {
-                    "maxFeePerGas":         int(base_fee * GAS_MULTIPLIER) + priority,
-                    "maxPriorityFeePerGas": priority,
-                }
-            except Exception:
-                self._gas = {
-                    "maxFeePerGas":         self.w3.to_wei("35", "gwei"),
-                    "maxPriorityFeePerGas": self.w3.to_wei(str(PRIORITY_GWEI), "gwei"),
-                }
-            self._gas_ts = time.time()
-
-    def gas(self) -> dict:
-        if self._gas is None or (time.time() - self._gas_ts) > GAS_CACHE_TTL:
-            # Refresh in background — don't block fire path
-            threading.Thread(target=self._refresh_gas, daemon=True).start()
-        return self._gas
-
-    # ── Nonce ─────────────────────────────────────────
-
-    def _refresh_nonce(self):
-        with self._nonce_lock:
-            self._nonce = self.w3.eth.get_transaction_count(self.me)
-
-    def next_nonce(self) -> int:
-        with self._nonce_lock:
-            n = self._nonce
-            self._nonce += 1
-            return n
-
-    def reset_nonce(self):
-        threading.Thread(target=self._refresh_nonce, daemon=True).start()
-
-    # ── Dedup ─────────────────────────────────────────
-
-    def already_fired(self, wallet: str) -> bool:
-        w = wallet.lower()
-        with self._fired_lock:
-            if w in self._fired:
-                return True
-            self._fired.add(w)
-            return False
-
-    # ── Calibrate ─────────────────────────────────────
-
-    def calibrate(self):
-        log(f"📐 [{self.name.upper()}] Calibrating…")
-        try:
-            res   = requests.get(API_URL, headers=HEADERS, timeout=15)
-            users = res.json().get("users", [])
-            for u in users:
-                if u.get("selected_chain", "").lower() != self.name:
-                    continue
-                wallet = u.get("wallet_address")
-                if not wallet:
-                    continue
-                try:
-                    subject = Web3.to_checksum_address(wallet)
-                    supply  = self.contract.functions.sharesSupply(subject).call()
-                    if supply != 0:
-                        continue
-                    raw = self.contract.functions.getBuyPriceAfterFee(
-                        subject, SHARE_AMOUNT
-                    ).call()
-                    self.first_buy = int(raw * SLIPPAGE)
-                    log(
-                        f"   ✅ [{self.name.upper()}] Price = "
-                        f"{float(self.w3.from_wei(self.first_buy, 'ether')):.8f} "
-                        f"{self.symbol} (+{int((SLIPPAGE-1)*100)}% slip)"
-                    )
-                    return
-                except Exception:
-                    continue
-
-            # Fallback
-            fallback = {"avalanche": "0.015", "bsc": "0.005"}[self.name]
-            self.first_buy = self.w3.to_wei(fallback, "ether")
-            log(f"   ⚠️  [{self.name.upper()}] No zero-supply found — fallback {fallback} {self.symbol}")
-        except Exception as e:
-            log(f"   ❌ [{self.name.upper()}] Calibration error: {e}")
-            self.first_buy = self.w3.to_wei("0.02", "ether")
-
-
-# ══════════════════════════════════════════════════════
-#  BUILD + SIGN  — raw transaction, fastest possible
-# ══════════════════════════════════════════════════════
-
-def _build_raw(client: ChainClient, subject: str, nonce: int, gas_multiplier: float = 1.0) -> bytes:
-    """
-    Build and sign a raw transaction using pre-encoded calldata.
-    Only swaps the subject address — no ABI encoding at call time.
-    """
-    data    = swap_subject_in_calldata(client._base_calldata, subject)
-    g       = client.gas()
-    max_fee = int(g["maxFeePerGas"] * gas_multiplier)
-    pri_fee = int(g["maxPriorityFeePerGas"] * gas_multiplier)
-
-    tx = {
-        "to":                   Web3.to_checksum_address(client.cfg["contract"]),
-        "value":                client.first_buy,
-        "gas":                  GAS_LIMIT,
-        "maxFeePerGas":         max_fee,
-        "maxPriorityFeePerGas": pri_fee,
-        "nonce":                nonce,
-        "chainId":              client.cfg["chain_id"],
-        "data":                 data,
-        "type":                 2,   # EIP-1559
-    }
-
-    signed: SignedTransaction = Account.sign_transaction(tx, PRIVATE_KEY)
-    return signed.raw_transaction
-
-
-def _send_raw(client: ChainClient, raw: bytes, label: str) -> str | None:
-    """Send a raw tx, return tx hex or None."""
+def get_dynamic_gas(w3) -> dict:
+    """Fetch live base fee and build EIP-1559 gas params."""
     try:
-        tx_hash = client.w3.eth.send_raw_transaction(raw)
-        return "0x" + tx_hash.hex()
+        latest   = w3.eth.get_block("latest")
+        base_fee = latest["baseFeePerGas"]
+        priority = w3.to_wei(str(PRIORITY_GWEI), "gwei")
+        max_fee  = int(base_fee * GAS_MULTIPLIER) + priority
+        return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority}
+    except Exception:
+        # Fallback to safe static values if block fetch fails
+        log("⚠️  Dynamic gas fetch failed — using fallback 35 gwei")
+        return {
+            "maxFeePerGas":         w3.to_wei("35", "gwei"),
+            "maxPriorityFeePerGas": w3.to_wei(str(PRIORITY_GWEI), "gwei"),
+        }
+
+
+# ══════════════════════════════════════════════════════
+#  SUPPLY CHECK
+# ══════════════════════════════════════════════════════
+
+def has_zero_supply(chain: str, wallet_address: str) -> bool:
+    """Return True only if sharesSupply == 0 (no one has bought yet)."""
+    try:
+        w3, contract, _ = get_contract(chain)
+        subject = Web3.to_checksum_address(wallet_address)
+        supply  = contract.functions.sharesSupply(subject).call()
+        log(f"📊 Supply for {wallet_address[:10]}…: {supply}")
+        return supply == 0
     except Exception as e:
-        # Ignore "already known" — means another war tx landed
-        if "already known" not in str(e).lower() and "nonce too low" not in str(e).lower():
-            log(f"⚠️  Send error [{label}]: {e}")
-        return None
+        log(f"⚠️  Supply check failed: {e}")
+        return False   # fail-safe: skip rather than buy blind
 
 
 # ══════════════════════════════════════════════════════
-#  FIRE  — gas war: 3 txs at once, different gas prices
+#  BUY
 # ══════════════════════════════════════════════════════
 
-def fire(username: str, wallet: str, chain: str, source: str):
-    client = clients[chain]
+def buy_shares(username: str, wallet_address: str, chain: str):
+    w3, contract, cfg = get_contract(chain)
+    symbol = cfg["symbol"]
 
-    if client.already_fired(wallet):
-        return
-
-    if not client.first_buy:
-        log(f"⚠️  Price not ready for {chain} — skipping @{username}")
-        return
-
-    t0      = time.time()
-    subject = Web3.to_checksum_address(wallet)
-
-    log(f"⚡ [{source}] @{username} ({chain.upper()}) — FIRING GAS WAR")
-
-    # Pre-build all 3 signed txs (fast — just bytes manipulation + signing)
-    raws   = []
-    nonces = []
-    for i, gm in enumerate(GAS_WAR_MULTIPLIERS):
-        n = client.next_nonce()
-        nonces.append(n)
-        raws.append(_build_raw(client, subject, n, gm))
-
-    # Fire all 3 simultaneously in threads
-    tx_hexes = [None] * len(raws)
-
-    def send(idx, raw):
-        label    = f"war-{idx+1}"
-        tx_hex   = _send_raw(client, raw, label)
-        elapsed  = (time.time() - t0) * 1000
-        if tx_hex:
-            tx_hexes[idx] = tx_hex
-            log(f"📡 [{label}] fired in {elapsed:.0f}ms → {tx_hex}")
-
-    threads = [threading.Thread(target=send, args=(i, r), daemon=True) for i, r in enumerate(raws)]
-    for t in threads: t.start()
-    for t in threads: t.join()
-
-    # Confirm whichever landed (background)
-    for tx_hex in tx_hexes:
-        if tx_hex:
-            threading.Thread(
-                target=_confirm,
-                args=(username, chain, tx_hex, client.first_buy, t0, source),
-                daemon=True,
-            ).start()
-            break   # only need to confirm one
-
-
-def _confirm(username, chain, tx_hex, price, t0, source):
-    client = clients[chain]
     try:
-        receipt  = client.w3.eth.wait_for_transaction_receipt(
-            bytes.fromhex(tx_hex[2:]), timeout=TX_TIMEOUT
+        subject = Web3.to_checksum_address(wallet_address)
+        me      = Web3.to_checksum_address(MY_WALLET)
+
+        # ── Quote ────────────────────────────────────
+        raw_price  = contract.functions.getBuyPriceAfterFee(subject, SHARE_AMOUNT).call()
+        price      = int(raw_price * SLIPPAGE)          # apply slippage buffer
+        price_coin = float(w3.from_wei(price, "ether"))
+        log(f"💰 Price for {SHARE_AMOUNT} units: {price_coin:.6f} {symbol} (incl. {int((SLIPPAGE-1)*100)}% buffer)")
+
+        # ── Balance check ────────────────────────────
+        balance      = w3.eth.get_balance(me)
+        balance_coin = float(w3.from_wei(balance, "ether"))
+        log(f"💳 Wallet balance: {balance_coin:.6f} {symbol}")
+
+        if balance < price:
+            msg = (
+                f"❌ Insufficient balance on {chain.upper()} for @{username}\n"
+                f"Need: {price_coin:.6f} {symbol} | Have: {balance_coin:.6f} {symbol}"
+            )
+            log(msg)
+            send_telegram(msg)
+            return
+
+        # ── Build tx ─────────────────────────────────
+        gas_params = get_dynamic_gas(w3)
+        nonce      = w3.eth.get_transaction_count(me)
+
+        tx = contract.functions.buyShares(subject, me, SHARE_AMOUNT).build_transaction(
+            {
+                "from":    me,
+                "value":   price,
+                "gas":     GAS_LIMIT,
+                "nonce":   nonce,
+                "chainId": cfg["chain_id"],
+                **gas_params,
+            }
         )
-        total_ms = (time.time() - t0) * 1000
-        now      = time.strftime("%Y-%m-%d %I:%M %p")
-        price_h  = float(client.w3.from_wei(price, "ether"))
+
+        # ── Sign & send ──────────────────────────────
+        signed  = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hex  = "0x" + tx_hash.hex()
+        log(f"📡 TX submitted: {tx_hex}")
+        log(f"⏳ Waiting for on-chain confirmation (timeout {TX_TIMEOUT}s)…")
+
+        # ── Wait for receipt ─────────────────────────
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=TX_TIMEOUT)
+        now     = time.strftime("%Y-%m-%d %I:%M %p")
 
         if receipt["status"] == 1:
-            log(f"✅ CONFIRMED @{username} | gas: {receipt['gasUsed']:,} | {total_ms:.0f}ms")
-            tg(
+            # ✅ Confirmed success
+            gas_used = receipt["gasUsed"]
+            log(f"✅ Sniped @{username} on {chain.upper()}! Gas used: {gas_used}")
+            log(f"🔗 {cfg['explorer']}{tx_hex}")
+
+            send_telegram(
                 f"🎯 <b>Sniped @{username}!</b>\n\n"
-                f"⛓️ {chain.upper()} | 📡 {source}\n"
-                f"💰 {price_h:.8f} {client.symbol}\n"
-                f"⛽ Gas: {receipt['gasUsed']:,}\n"
-                f"⚡ {total_ms:.0f}ms\n"
+                f"⛓️ Chain: {chain.upper()}\n"
+                f"💰 Paid: {price_coin:.6f} {symbol}\n"
+                f"⛽ Gas used: {gas_used:,}\n"
                 f"🕐 {now}\n"
-                f"🔗 {client.cfg['explorer']}{tx_hex}"
+                f"🔗 {cfg['explorer']}{tx_hex}"
             )
-            threading.Thread(target=client.calibrate, daemon=True).start()
         else:
-            log(f"❌ REVERTED @{username} | {tx_hex}")
-            tg(
-                f"❌ <b>Reverted @{username}</b>\n\n"
-                f"⛓️ {chain.upper()}\n"
-                f"⚠️ Price moved or already bought\n"
-                f"🔗 {client.cfg['explorer']}{tx_hex}"
+            # ❌ TX reverted on-chain
+            log(f"❌ TX REVERTED on-chain for @{username}!")
+            log(f"🔗 {cfg['explorer']}{tx_hex}")
+
+            send_telegram(
+                f"❌ <b>TX REVERTED for @{username}</b>\n\n"
+                f"⛓️ Chain: {chain.upper()}\n"
+                f"💸 Gas lost: {receipt['gasUsed']:,} units\n"
+                f"🕐 {now}\n"
+                f"🔗 {cfg['explorer']}{tx_hex}\n\n"
+                f"⚠️ Possible cause: price moved (someone sniped first)"
             )
-            threading.Thread(target=client.calibrate, daemon=True).start()
-            client.reset_nonce()
+
     except Exception as e:
-        log(f"⚠️  Receipt @{username}: {e}")
-        client.reset_nonce()
+        log(f"❌ Buy failed for @{username}: {e}")
+        send_telegram(f"❌ Buy error for @{username} on {chain.upper()}\n<code>{e}</code>")
 
 
 # ══════════════════════════════════════════════════════
 #  SELL
 # ══════════════════════════════════════════════════════
 
-def sell_shares(username: str, wallet: str, chain: str, amount="all"):
-    client = clients[chain]
+def sell_shares(username: str, wallet_address: str, chain: str, amount=SHARE_AMOUNT):
+    """
+    Sell shares of a specific user.
+    amount: integer unit count, or "all" to sell everything held.
+    """
+    w3, contract, cfg = get_contract(chain)
+    symbol = cfg["symbol"]
+
     try:
-        subject = Web3.to_checksum_address(wallet)
-        held    = client.contract.functions.sharesBalance(subject, client.me).call()
+        subject = Web3.to_checksum_address(wallet_address)
+        me      = Web3.to_checksum_address(MY_WALLET)
+
+        # ── Check holdings ───────────────────────────
+        held = contract.functions.sharesBalance(subject, me).call()
+        log(f"📦 You hold {held} units of @{username} on {chain.upper()}")
+
         if held == 0:
-            log(f"⚠️  Nothing to sell @{username}")
+            log(f"⚠️  Nothing to sell for @{username}")
             return
-        sell_amt   = held if amount == "all" else min(int(amount), held)
-        sell_price = client.contract.functions.getSellPriceAfterFee(subject, sell_amt).call()
-        sell_eth   = float(client.w3.from_wei(sell_price, "ether"))
-        log(f"💰 Selling {sell_amt} units @{username} → {sell_eth:.8f} {client.symbol}")
 
-        data = client.contract.encode_abi(
-            "sellShares",
-            args=[subject, client.me, sell_amt],
+        sell_amt = held if amount == "all" else min(int(amount), held)
+
+        # ── Quote ────────────────────────────────────
+        sell_price     = contract.functions.getSellPriceAfterFee(subject, sell_amt).call()
+        sell_price_eth = float(w3.from_wei(sell_price, "ether"))
+        log(f"💰 Sell return for {sell_amt} units: {sell_price_eth:.6f} {symbol}")
+
+        # ── Build tx ─────────────────────────────────
+        gas_params = get_dynamic_gas(w3)
+        nonce      = w3.eth.get_transaction_count(me)
+
+        tx = contract.functions.sellShares(subject, me, sell_amt).build_transaction(
+            {
+                "from":    me,
+                "gas":     GAS_LIMIT,
+                "nonce":   nonce,
+                "chainId": cfg["chain_id"],
+                **gas_params,
+            }
         )
-        nonce = client.next_nonce()
-        g     = client.gas()
-        tx    = {
-            "to":                   Web3.to_checksum_address(client.cfg["contract"]),
-            "value":                0,
-            "gas":                  GAS_LIMIT,
-            "maxFeePerGas":         g["maxFeePerGas"],
-            "maxPriorityFeePerGas": g["maxPriorityFeePerGas"],
-            "nonce":                nonce,
-            "chainId":              client.cfg["chain_id"],
-            "data":                 data,
-            "type":                 2,
-        }
-        signed  = Account.sign_transaction(tx, PRIVATE_KEY)
-        tx_hash = client.w3.eth.send_raw_transaction(signed.raw_transaction)
-        tx_hex  = "0x" + tx_hash.hex()
-        log(f"📡 Sell: {tx_hex}")
 
-        receipt = client.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=TX_TIMEOUT)
+        # ── Sign & send ──────────────────────────────
+        signed  = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hex  = "0x" + tx_hash.hex()
+        log(f"📡 Sell TX submitted: {tx_hex}")
+        log(f"⏳ Waiting for confirmation…")
+
+        # ── Wait for receipt ─────────────────────────
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=TX_TIMEOUT)
         now     = time.strftime("%Y-%m-%d %I:%M %p")
+
         if receipt["status"] == 1:
-            log(f"✅ Sold {sell_amt} @{username}")
-            tg(
+            log(f"✅ Sold {sell_amt} units of @{username}! Received {sell_price_eth:.6f} {symbol}")
+            log(f"🔗 {cfg['explorer']}{tx_hex}")
+
+            send_telegram(
                 f"💸 <b>Sold @{username}!</b>\n\n"
-                f"⛓️ {chain.upper()}\n"
-                f"📦 {sell_amt} units\n"
-                f"💰 {sell_eth:.8f} {client.symbol}\n"
+                f"⛓️ Chain: {chain.upper()}\n"
+                f"📦 Amount: {sell_amt} units\n"
+                f"💰 Received: {sell_price_eth:.6f} {symbol}\n"
                 f"🕐 {now}\n"
-                f"🔗 {client.cfg['explorer']}{tx_hex}"
+                f"🔗 {cfg['explorer']}{tx_hex}"
             )
         else:
-            log(f"❌ Sell reverted @{username}")
-            client.reset_nonce()
-    except Exception as e:
-        log(f"❌ Sell error @{username}: {e}")
-        clients[chain].reset_nonce()
+            log(f"❌ Sell TX reverted for @{username}!")
+            send_telegram(
+                f"❌ <b>Sell REVERTED for @{username}</b>\n"
+                f"⛓️ {chain.upper()}\n"
+                f"🔗 {cfg['explorer']}{tx_hex}"
+            )
 
+    except Exception as e:
+        log(f"❌ Sell failed for @{username}: {e}")
+        send_telegram(f"❌ Sell error for @{username}\n<code>{e}</code>")
+
+
+# ══════════════════════════════════════════════════════
+#  SELL ALL HOLDINGS
+# ══════════════════════════════════════════════════════
 
 def sell_all_holdings():
-    log("🔄 Selling all holdings…")
+    log("🔄 Fetching holdings from BOI API…")
     try:
         res   = requests.get(API_URL, headers=HEADERS, timeout=15)
         users = res.json().get("users", [])
-        count = 0
+
+        sold_count = 0
         for u in users:
             wallet = u.get("wallet_address")
             chain  = u.get("selected_chain", "").lower()
             uname  = u.get("username", "unknown")
+
             if not wallet or chain not in CHAINS:
                 continue
-            client  = clients[chain]
+
+            w3, contract, _ = get_contract(chain)
             subject = Web3.to_checksum_address(wallet)
-            held    = client.contract.functions.sharesBalance(subject, client.me).call()
+            me      = Web3.to_checksum_address(MY_WALLET)
+            held    = contract.functions.sharesBalance(subject, me).call()
+
             if held > 0:
+                log(f"📦 Selling {held} units of @{uname} on {chain.upper()}")
                 sell_shares(uname, wallet, chain, amount="all")
-                count += 1
-                time.sleep(1.5)
-        log(f"✅ Sold {count} positions.")
+                sold_count += 1
+                time.sleep(1.5)   # small delay between sells
+
+        if sold_count == 0:
+            log("ℹ️  No holdings found to sell.")
+
     except Exception as e:
-        log(f"❌ Sell-all: {e}")
+        log(f"❌ Sell-all error: {e}")
 
 
 # ══════════════════════════════════════════════════════
-#  MEMPOOL WATCHER
-#  Subscribes to full pending tx bodies — no extra
-#  get_transaction() RPC call needed.
+#  NEW ARRIVALS WATCHER
 # ══════════════════════════════════════════════════════
 
-def _decode_subject(input_hex: str) -> str | None:
-    """Extract _sharesSubject from buyShares calldata. Pure bytes — zero RPC."""
+def check_new_arrivals():
+    global first_run
+
     try:
-        data = input_hex[2:] if input_hex.startswith("0x") else input_hex
-        if not data.startswith(BUY_SEL):
-            return None
-        # [4 sel][32 subject][32 to][32 amount]
-        subject_word = data[8:72]                        # 32 bytes as hex
-        return Web3.to_checksum_address("0x" + subject_word[24:])  # last 20 bytes
-    except Exception:
-        return None
+        res = requests.get(API_URL, headers=HEADERS, timeout=15)
 
+        if res.status_code != 200:
+            log(f"⚠️  API error {res.status_code}")
+            return
 
-def _watch_mempool(chain: str):
-    cfg = CHAINS[chain]
+        users = res.json().get("users", [])
 
-    # Subscribe to newPendingTransactions with full tx bodies (True flag)
-    sub_msg = json.dumps({
-        "jsonrpc": "2.0",
-        "id":      1,
-        "method":  "eth_subscribe",
-        "params":  ["newPendingTransactions", True],   # True = full body
-    })
+        # ── First run: seed known IDs ────────────────
+        if first_run:
+            for u in users:
+                seen_ids.add(u["id"])
+            first_run = False
+            log(f"🌱 Seeded {len(seen_ids)} existing users. Watching for new arrivals…\n")
+            return
 
-    def on_message(ws, message):
-        try:
-            data = json.loads(message)
-            tx   = data.get("params", {}).get("result")
-            if not tx or not isinstance(tx, dict):
-                return
+        # ── Check for new entries ────────────────────
+        for u in users:
+            if u["id"] in seen_ids:
+                continue
 
-            # Filter: only BOI contract txs
-            if (tx.get("to") or "").lower() != cfg["contract"].lower():
-                return
+            seen_ids.add(u["id"])
 
-            subject = _decode_subject(tx.get("input", ""))
-            if not subject:
-                return
+            username = u.get("username", "unknown")
+            wallet   = u.get("wallet_address")
+            chain    = u.get("selected_chain", "").lower()
 
-            log(f"🔭 [{chain.upper()}] Mempool → {subject[:12]}…")
-            threading.Thread(
-                target=fire,
-                args=("mp_" + subject[:8], subject, chain, "MEMPOOL"),
-                daemon=True,
-            ).start()
+            log(f"🆕 New arrival: @{username} | chain: {chain}")
 
-        except Exception:
-            pass
+            if chain not in CHAINS:
+                log(f"⏭️  Chain '{chain}' not supported — skipping\n")
+                continue
 
-    def on_error(ws, err):
-        log(f"⚠️  [{chain.upper()}] WS: {err}")
+            if not wallet:
+                log(f"⚠️  No wallet for @{username} — skipping\n")
+                continue
 
-    def on_close(ws, *_):
-        log(f"🔌 [{chain.upper()}] WS closed — retry in 3s")
-        time.sleep(3)
-        # Don't call recursively — let the thread restart it
-    threading.Thread(
-        target=_watch_mempool,
-        args=(chain,),
-        daemon=True
-    ).start()
-    def on_open(ws):
-        log(f"✅ [{chain.upper()}] Mempool WS live")
-        ws.send(sub_msg)
+            # ── Zero-supply gate ─────────────────────
+            if has_zero_supply(chain, wallet):
+                log(f"✅ Zero supply confirmed — sniping @{username}!")
+                buy_shares(username, wallet, chain)
+            else:
+                log(f"⏭️  @{username} already has buyers — skipping\n")
 
-    websocket.WebSocketApp(
-        cfg["rpc_ws"],
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-    ).run_forever(ping_interval=30, ping_timeout=10)
+    except Exception as e:
+        log(f"❌ Poll error: {e}")
 
 
 # ══════════════════════════════════════════════════════
-#  HTTP FALLBACK POLLER
+#  ENTRY POINT
 # ══════════════════════════════════════════════════════
 
-_seen   = set()
-_seeded = False
-
-def _http_loop():
-    global _seeded
-    log("🌐 HTTP fallback started")
-    while True:
-        try:
-            res = requests.get(API_URL, headers=HEADERS, timeout=10)
-            if res.status_code == 200:
-                users = res.json().get("users", [])
-                if not _seeded:
-                    _seen.update(u["id"] for u in users)
-                    _seeded = True
-                    log(f"🌱 HTTP seeded {len(_seen)} users")
-                else:
-                    for u in users:
-                        if u["id"] not in _seen:
-                            _seen.add(u["id"])
-                            uname  = u.get("username", "unknown")
-                            wallet = u.get("wallet_address")
-                            chain  = u.get("selected_chain", "").lower()
-                            log(f"🌐 [HTTP] @{uname} | {chain}")
-                            if wallet and chain in CHAINS:
-                                threading.Thread(
-                                    target=fire,
-                                    args=(uname, wallet, chain, "HTTP"),
-                                    daemon=True,
-                                ).start()
-        except Exception as e:
-            log(f"⚠️  HTTP: {e}")
-        time.sleep(HTTP_POLL_INTERVAL)
-
-
-# ══════════════════════════════════════════════════════
-#  PERIODIC RE-CALIBRATION  (every 5 min)
-# ══════════════════════════════════════════════════════
-
-def _recal_loop():
-    while True:
-        time.sleep(300)
-        log("🔄 Re-calibrating…")
-        for c in clients.values():
-            c.calibrate()
-
-
-# ══════════════════════════════════════════════════════
-#  INIT
-# ══════════════════════════════════════════════════════
-
-clients: dict[str, ChainClient] = {}
-
-def init():
-    for name in CHAINS:
-        log(f"🔌 [{name.upper()}] Initialising…")
-        c = ChainClient(name)
-        c.init()
-        clients[name] = c
-    log("")
-    log("📐 Calibrating prices…")
-    for c in clients.values():
-        c.calibrate()
-    log("")
-
-
-# ══════════════════════════════════════════════════════
-#  BANNER
-# ══════════════════════════════════════════════════════
-
-def banner():
-    print()
-    print("╔═══════════════════════════════════════════════════╗")
-    print("║    BOI THE BEAR — MAX SPEED SNIPER  v5.0         ║")
-    print("╠═══════════════════════════════════════════════════╣")
-    print(f"║  💳 {MY_WALLET[:38]}")
-    print(f"║  ⛓️  AVALANCHE + BSC")
-    print(f"║  🎯 {SHARE_AMOUNT} units | 🛡️ {int((SLIPPAGE-1)*100)}% slip | ⛽ {PRIORITY_GWEI} gwei priority")
-    print(f"║  💣 Gas war: {GAS_WAR_MULTIPLIERS} multipliers")
-    print(f"║  🔭 Mempool WS — full tx body (no extra RPC)")
-    print(f"║  🌐 HTTP fallback — {int(HTTP_POLL_INTERVAL*1000)}ms")
-    print(f"║  📐 Auto-calibrate — startup + post-snipe + 5min")
-    print(f"║  🚫 Zero extra RPC calls at fire time")
-    print("╚═══════════════════════════════════════════════════╝")
+def print_banner():
+    print("=" * 54)
+    print("   BOI THE BEAR — TICKET SNIPER  v2.0")
+    print("=" * 54)
+    print(f"  💳 Wallet  : {MY_WALLET}")
+    print(f"  ⛓️  Chains  : AVALANCHE + BSC")
+    print(f"  🎯 Amount  : {SHARE_AMOUNT} units (1 ticket)")
+    print(f"  🛡️  Slippage: {int((SLIPPAGE - 1) * 100)}%")
+    print(f"  ⛽ Gas     : dynamic (base × {GAS_MULTIPLIER} + {PRIORITY_GWEI} gwei)")
+    print(f"  ✅ Receipt : on-chain confirmation before reporting")
+    print("=" * 54)
     print()
 
-
-# ══════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    banner()
-    init()
+    print_banner()
 
-    tg(
-        f"🤖 <b>BOI Max Speed Sniper v5.0</b>\n\n"
-        f"💳 <code>{MY_WALLET}</code>\n"
-        f"⛓️ AVAX + BSC\n"
-        f"💣 Gas war: {GAS_WAR_MULTIPLIERS}\n"
-        f"📐 Price: AUTO-CALIBRATED"
+    send_telegram(
+        f"🤖 <b>BOI Sniper v2.0 is live!</b>\n\n"
+        f"⛓️ Chains: AVALANCHE + BSC\n"
+        f"💳 Wallet: <code>{MY_WALLET}</code>\n"
+        f"🎯 Amount: {SHARE_AMOUNT} units per snipe\n"
+        f"🛡️ Slippage buffer: {int((SLIPPAGE - 1) * 100)}%\n"
+        f"✅ On-chain receipt check: ENABLED"
     )
 
-    # Start mempool watchers
-    for chain in CHAINS:
-        t = threading.Thread(target=_watch_mempool, args=(chain,), daemon=True)
-        t.start()
-        log(f"🔭 [{chain.upper()}] Mempool thread started: {t.is_alive()}")
+    # ── Manual sell examples (uncomment to use) ──────────────────────────
+    # Sell specific amount for a user:
+    # sell_shares("username", "0xWALLET", "bsc", amount=100)
+    #
+    # Sell all units for a user:
+    # sell_shares("username", "0xWALLET", "avalanche", amount="all")
+    #
+    # Sell every holding across all users:
+    # sell_all_holdings()
+    # ─────────────────────────────────────────────────────────────────────
 
-    # Start HTTP fallback
-    t2 = threading.Thread(target=_http_loop, daemon=True)
-    t2.start()
-    log(f"🌐 HTTP thread started: {t2.is_alive()}")
-
-    # Start recalibration loop
-    t3 = threading.Thread(target=_recal_loop, daemon=True)
-    t3.start()
-    log(f"🔄 Recal thread started: {t3.is_alive()}")
-
-    log("🚀 All threads running. Ctrl+C to stop.\n")
-
-    try:
-        while True:
-            time.sleep(30)
-            log(f"💓 alive | threads: mempool={t.is_alive()} http={t2.is_alive()}")
-    except KeyboardInterrupt:
-        log("🛑 Stopped.")
+    # Main sniper loop
+    while True:
+        check_new_arrivals()
+        time.sleep(POLL_INTERVAL)
