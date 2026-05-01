@@ -19,12 +19,12 @@ SLIPPAGE        = 1.10       # 10% slippage buffer
 GAS_LIMIT       = 250000     # Slightly higher for safety
 PRIORITY_GWEI   = 2          # maxPriorityFeePerGas
 GAS_MULTIPLIER  = 1.25       # base fee multiplier
-POLL_INTERVAL   = 1          # seconds between new-arrival checks
+POLL_INTERVAL   = 0.5          # seconds between new-arrival checks
 TX_TIMEOUT      = 60         # seconds to wait for receipt
 
 API_URL = (
     "https://www.boithebear.com/api/socialfi/new-arrivals"
-    "?limit=10&offset=0&userId=562acdb3-50d7-49aa-86d4-1b778da6ca12"
+    "?limit=20&offset=0&userId=562acdb3-50d7-49aa-86d4-1b778da6ca12"
 )
 
 # ── CHAINS ────────────────────────────────────────────
